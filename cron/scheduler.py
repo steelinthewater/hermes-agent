@@ -4975,14 +4975,6 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, the advance keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        # Batched: one load + one save for the whole due set, not one per job.
-        advance_next_runs([job["id"] for job in due_jobs])
-
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
@@ -5026,17 +5018,15 @@ def tick(
         sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
         parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
 
-        _results: list = []
-        _all_futures: list = []
+        # Build both required pools before reserving jobs. A pool failure must
+        # not leave an execution row or running guard without a worker.
+        seq_pool = _get_sequential_pool() if sequential_jobs else None
+        parallel_pool = _get_parallel_pool(_max_workers) if parallel_jobs else None
 
-        def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor):
-            """Submit a job fire-and-forget with the in-flight dedup guard.
-
-            Returns the future, or None if the job was skipped because a prior
-            tick's run of the same job is still in flight.  The running-set
-            membership is released in the worker's finally block.
-            """
+        def _reserve_with_guard(job: dict):
+            """Reserve one due job before its recurring schedule advances."""
             job_id = job["id"]
+            job_label = job.get("name", job_id)
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
@@ -5045,19 +5035,72 @@ def tick(
             if _interpreter_shutting_down():
                 logger.warning(
                     "Job '%s' not dispatched — interpreter is shutting down",
-                    job.get("name", job_id),
+                    job_label,
                 )
-                return None
+                return None, False
             if not try_register_running_job(job_id):
-                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                return None
+                logger.info("Job '%s' already running — skipping", job_label)
+                return None, True
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
-            dispatched_job = dict(job, execution_id=execution["id"])
+            try:
+                execution = create_execution(job_id, source="builtin")
+                return dict(job, execution_id=execution["id"]), True
+            except Exception as execution_err:
+                release_running_job(job_id)
+                logger.exception(
+                    "Job '%s' not dispatched: execution creation failed: %s",
+                    job_label,
+                    execution_err,
+                )
+                return None, False
+
+        reserved_jobs = []
+        advance_ids = []
+        for job in due_jobs:
+            reserved_job, should_advance = _reserve_with_guard(job)
+            if should_advance:
+                advance_ids.append(job["id"])
+            if reserved_job is not None:
+                reserved_jobs.append(reserved_job)
+
+        # Advance reserved and already-running jobs in one write. A failed
+        # execution record stays due for the next ticker pass.
+        try:
+            advance_next_runs(advance_ids)
+        except Exception as advance_err:
+            for job in reserved_jobs:
+                release_running_job(job["id"])
+                try:
+                    finish_execution(
+                        job["execution_id"],
+                        success=False,
+                        error=f"Schedule advance failed: {advance_err}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not finish execution after schedule advance failed for job '%s'",
+                        job.get("name", job["id"]),
+                    )
+            raise
+
+        sequential_jobs = [
+            job for job in reserved_jobs if (job.get("workdir") or "").strip()
+        ]
+        parallel_jobs = [
+            job for job in reserved_jobs if not (job.get("workdir") or "").strip()
+        ]
+
+        _results: list = []
+        _all_futures: list = []
+
+        def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor):
+            """Submit a reserved job and release its guard after execution."""
+            job_id = job["id"]
+            job_label = job.get("name", job_id)
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
+            def _run_and_release(j=job, ctx=_ctx):
                 try:
                     return ctx.run(_process_job, j)
                 finally:
@@ -5067,22 +5110,29 @@ def tick(
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
                 release_running_job(job_id)
-                finish_execution(
-                    execution["id"],
-                    success=False,
-                    error=f"Executor dispatch failed: {submit_err}",
-                )
+                try:
+                    finish_execution(
+                        job["execution_id"],
+                        success=False,
+                        error=f"Executor dispatch failed: {submit_err}",
+                    )
+                except Exception as finish_err:
+                    logger.error(
+                        "Could not finish execution after dispatch failed for job '%s': %s",
+                        job_label,
+                        finish_err,
+                    )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
                     logger.warning(
                         "Job '%s' not dispatched — interpreter is shutting down",
-                        job.get("name", job_id),
+                        job_label,
                     )
                     return None
                 logger.error(
                     "Job '%s' not dispatched: %s",
-                    job.get("name", job_id),
+                    job_label,
                     submit_err,
                 )
                 return None
@@ -5094,7 +5144,6 @@ def tick(
         # pass, just serialized).  The in-flight guard prevents a still-running
         # job from being re-queued on the next tick.
         if sequential_jobs:
-            seq_pool = _get_sequential_pool()
             for job in sequential_jobs:
                 fut = _submit_with_guard(job, seq_pool)
                 if fut is None:
@@ -5109,9 +5158,8 @@ def tick(
         # after completion finds the job due again naturally.  No catch-up
         # queue needed.
         if parallel_jobs:
-            pool = _get_parallel_pool(_max_workers)
             for job in parallel_jobs:
-                fut = _submit_with_guard(job, pool)
+                fut = _submit_with_guard(job, parallel_pool)
                 if fut is None:
                     continue
                 _all_futures.append(fut)
